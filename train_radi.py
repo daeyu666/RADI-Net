@@ -1,9 +1,6 @@
 """
 RADI-Net 第一版训练脚本。
 
-默认使用仓库已有的 config.py / data_loader.py / metrics.py / utils.py。
-模型结构位于 models/radi_net.py。
-
 示例：
 python train_radi.py --dataset PaviaU --msi_mode srf --srf_band_set wv2_visible6 --epochs 300 --batch_size 4
 """
@@ -43,10 +40,19 @@ def make_checkpoint_paths(cfg, run_name: str) -> Dict[str, str]:
     save_dir = os.path.join(cfg.checkpoint_root, "radi_net", run_name)
     os.makedirs(save_dir, exist_ok=True)
     return {
-        "dir": save_dir,
         "best": os.path.join(save_dir, "best.pth"),
         "last": os.path.join(save_dir, "last.pth"),
     }
+
+
+def compact_info(info: dict) -> dict:
+    """避免把 SRF 权重矩阵、波长数组完整写进日志。"""
+    out = {k: v for k, v in info.items() if k not in ("srf_weights", "hsi_wavelengths")}
+    if info.get("srf_weights") is not None:
+        out["srf_weights_shape"] = tuple(info["srf_weights"].shape)
+    if info.get("hsi_wavelengths") is not None:
+        out["hsi_wavelengths_shape"] = tuple(info["hsi_wavelengths"].shape)
+    return out
 
 
 def hsi_to_msi_torch(
@@ -83,19 +89,10 @@ def compute_loss(
     mse = F.mse_loss(pred, gt)
     sam = sam_loss(pred, gt)
 
-    pred_lr = F.interpolate(
-        pred,
-        size=lr_hsi.shape[-2:],
-        mode="bicubic",
-        align_corners=False,
-    )
+    pred_lr = F.interpolate(pred, size=lr_hsi.shape[-2:], mode="bicubic", align_corners=False)
     lr_consistency = F.l1_loss(pred_lr, lr_hsi)
 
-    pred_msi = hsi_to_msi_torch(
-        pred,
-        srf_weights=srf_weights,
-        n_msi_bands=hr_msi.shape[1],
-    )
+    pred_msi = hsi_to_msi_torch(pred, srf_weights=srf_weights, n_msi_bands=hr_msi.shape[1])
     msi_consistency = F.l1_loss(pred_msi, hr_msi)
 
     total = (
@@ -105,7 +102,6 @@ def compute_loss(
         + getattr(cfg, "lambda_dc", 0.1) * lr_consistency
         + getattr(cfg, "lambda_srf_region", 0.3) * msi_consistency
     )
-
     return {
         "total": total,
         "l1": l1.detach(),
@@ -136,15 +132,7 @@ def train_one_epoch(
         gt = batch["gt"]
 
         pred = model(lr_hsi, hr_msi)
-        losses = compute_loss(
-            pred=pred,
-            gt=gt,
-            lr_hsi=lr_hsi,
-            hr_msi=hr_msi,
-            cfg=cfg,
-            sam_loss=sam_loss,
-            srf_weights=srf_weights,
-        )
+        losses = compute_loss(pred, gt, lr_hsi, hr_msi, cfg, sam_loss, srf_weights)
 
         optimizer.zero_grad(set_to_none=True)
         losses["total"].backward()
@@ -163,18 +151,10 @@ def train_one_epoch(
 def evaluate(model: nn.Module, loader, device: torch.device, cfg) -> Dict[str, float]:
     model.eval()
     averager = MetricAverager()
-
     for batch in loader:
         batch = move_to_device(batch, device)
-        pred = model(batch["lr_hsi"], batch["hr_msi"])
-        pred = torch.clamp(pred, 0.0, 1.0)
-        metrics = calc_metrics(
-            pred=pred,
-            target=batch["gt"],
-            scale_ratio=cfg.scale_ratio,
-        )
-        averager.update(metrics)
-
+        pred = torch.clamp(model(batch["lr_hsi"], batch["hr_msi"]), 0.0, 1.0)
+        averager.update(calc_metrics(pred=pred, target=batch["gt"], scale_ratio=cfg.scale_ratio))
     return averager.average()
 
 
@@ -193,11 +173,7 @@ def main():
         residual_scale=0.2,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sam_loss = SAMLoss().to(device)
 
     srf_weights = info.get("srf_weights", None)
@@ -219,7 +195,7 @@ def main():
 
     write_log(log_path, f"Run name: {run_name}")
     write_log(log_path, f"Model parameters: {count_parameters(model):.3f} M")
-    write_log(log_path, f"Dataset info: {info}")
+    write_log(log_path, f"Dataset info: {compact_info(info)}")
 
     start_epoch = 1
     best_psnr = -1.0
@@ -236,15 +212,7 @@ def main():
         write_log(log_path, f"Resume from {cfg.resume}, start_epoch={start_epoch}, best_psnr={best_psnr:.4f}")
 
     for epoch in range(start_epoch, cfg.epochs + 1):
-        train_stats = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            cfg=cfg,
-            sam_loss=sam_loss,
-            srf_weights=srf_weights,
-        )
+        train_stats = train_one_epoch(model, train_loader, optimizer, device, cfg, sam_loss, srf_weights)
 
         if epoch % cfg.eval_interval == 0:
             val_metrics = evaluate(model, test_loader, device, cfg)
@@ -258,27 +226,13 @@ def main():
 
         extra = {
             "cfg": cfg.__dict__,
-            "info": info,
+            "info": compact_info(info),
             "run_name": run_name,
             "model_name": "RADINet-v1",
         }
-        save_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            epoch=epoch,
-            best_metric=best_psnr,
-            path=ckpt_paths["last"],
-            extra=extra,
-        )
+        save_checkpoint(model, optimizer, epoch, best_psnr, ckpt_paths["last"], extra=extra)
         if is_best:
-            save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                best_metric=best_psnr,
-                path=ckpt_paths["best"],
-                extra=extra,
-            )
+            save_checkpoint(model, optimizer, epoch, best_psnr, ckpt_paths["best"], extra=extra)
 
         row = {
             "epoch": epoch,
