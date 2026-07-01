@@ -11,10 +11,15 @@ from .radi_net import (
 from .plain_drt_baseline import (
     PlainDRTBaseline,
     DRTASGFBaseline,
+    DRTSparseBaseline,
     HSIContextASGFBlock,
+    SparseSelfAttentionBlock,
+    LayerNorm2d,
     baseline,
     Baseline,
     DRTBaseline,
     ASGFBaseline,
     DRTASGF,
+    SparseBaseline,
+    DRTSparse,
 )
