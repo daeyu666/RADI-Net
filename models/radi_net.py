@@ -1,12 +1,14 @@
 """
-RADI-Net 第一版。
+RADI-Net 第一版与 no-ASGF 消融版。
 
-这一版只实现一个简单、易读、可训练的 baseline：
+RADI-Net v1：
 1. LR-HSI bicubic 上采样后提取 HSI 光谱主体特征；
 2. 使用光谱上下文引导的 ASGF 提取 HR-MSI 空间特征；
 3. 拼接 HSI/MSI 特征后预测一个小残差，叠加到上采样 HSI 上。
 
-后续创新点一、二、三可以在这个文件内逐步加，不先拆成很多子模块。
+RADI-Net no-ASGF：
+保持主干、融合头、重建头不变，只把 ASGF 替换为普通 ResBlock MSI 编码器，
+用于验证 SpectralContextASGF 是否有效。
 """
 
 from typing import Dict, Union
@@ -54,6 +56,28 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(x + self.body(x))
+
+
+class PlainMSIResEncoder(nn.Module):
+    """
+    普通 MSI ResBlock 编码器。
+
+    这是 no-ASGF 消融使用的替代模块：
+    - 只从 HR-MSI 提取空间特征；
+    - 不使用 HSI 光谱上下文 gate；
+    - 不做小/中尺度非对称门控。
+    """
+
+    def __init__(self, msi_bands: int, channels: int):
+        super().__init__()
+        self.body = nn.Sequential(
+            ConvAct(msi_bands, channels, kernel_size=3),
+            ResidualBlock(channels),
+            ResidualBlock(channels),
+        )
+
+    def forward(self, hr_msi: torch.Tensor, hsi_feat: torch.Tensor = None) -> torch.Tensor:
+        return self.body(hr_msi)
 
 
 class SpectralContextASGF(nn.Module):
@@ -123,7 +147,8 @@ class RADINet(nn.Module):
         hsi_bands: HSI 波段数；
         msi_bands: MSI 波段数；
         channels: 中间特征通道数；
-        residual_scale: 限制残差幅度，避免第一版训练初期破坏 LR-HSI 光谱主体。
+        residual_scale: 限制残差幅度，避免第一版训练初期破坏 LR-HSI 光谱主体；
+        use_asgf: True 使用 SpectralContextASGF，False 使用普通 MSI ResBlock 编码器。
     """
 
     def __init__(
@@ -133,6 +158,7 @@ class RADINet(nn.Module):
         channels: int = 64,
         residual_scale: float = 0.2,
         upsample_mode: str = "bicubic",
+        use_asgf: bool = True,
     ):
         super().__init__()
         self.hsi_bands = hsi_bands
@@ -140,6 +166,7 @@ class RADINet(nn.Module):
         self.channels = channels
         self.residual_scale = residual_scale
         self.upsample_mode = upsample_mode
+        self.use_asgf = use_asgf
 
         self.hsi_encoder = nn.Sequential(
             ConvAct(hsi_bands, channels, kernel_size=3),
@@ -147,7 +174,10 @@ class RADINet(nn.Module):
             ResidualBlock(channels),
         )
 
-        self.msi_asgf = SpectralContextASGF(msi_bands=msi_bands, channels=channels)
+        if use_asgf:
+            self.msi_encoder = SpectralContextASGF(msi_bands=msi_bands, channels=channels)
+        else:
+            self.msi_encoder = PlainMSIResEncoder(msi_bands=msi_bands, channels=channels)
 
         self.fusion = nn.Sequential(
             ConvAct(channels * 2, channels, kernel_size=3),
@@ -176,7 +206,7 @@ class RADINet(nn.Module):
         hsi_up = torch.clamp(hsi_up, 0.0, 1.0)
 
         hsi_feat = self.hsi_encoder(hsi_up)
-        msi_feat = self.msi_asgf(hr_msi, hsi_feat)
+        msi_feat = self.msi_encoder(hr_msi, hsi_feat)
 
         fused = self.fusion(torch.cat([hsi_feat, msi_feat], dim=1))
         delta = torch.tanh(self.reconstruction(fused)) * self.residual_scale
@@ -193,8 +223,30 @@ class RADINet(nn.Module):
         return pred
 
 
+class RADINetNoASGF(RADINet):
+    """把 ASGF 替换为普通 MSI ResBlock 编码器的消融版本。"""
+
+    def __init__(
+        self,
+        hsi_bands: int,
+        msi_bands: int,
+        channels: int = 64,
+        residual_scale: float = 0.2,
+        upsample_mode: str = "bicubic",
+    ):
+        super().__init__(
+            hsi_bands=hsi_bands,
+            msi_bands=msi_bands,
+            channels=channels,
+            residual_scale=residual_scale,
+            upsample_mode=upsample_mode,
+            use_asgf=False,
+        )
+
+
 # 兼容不同命名习惯。
 RADI_Net = RADINet
+RADI_Net_No_ASGF = RADINetNoASGF
 
 
 def build_radi_net(
@@ -204,6 +256,21 @@ def build_radi_net(
     residual_scale: float = 0.2,
 ) -> RADINet:
     return RADINet(
+        hsi_bands=hsi_bands,
+        msi_bands=msi_bands,
+        channels=channels,
+        residual_scale=residual_scale,
+        use_asgf=True,
+    )
+
+
+def build_radi_net_no_asgf(
+    hsi_bands: int,
+    msi_bands: int,
+    channels: int = 64,
+    residual_scale: float = 0.2,
+) -> RADINetNoASGF:
+    return RADINetNoASGF(
         hsi_bands=hsi_bands,
         msi_bands=msi_bands,
         channels=channels,
